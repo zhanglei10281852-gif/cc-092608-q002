@@ -114,13 +114,39 @@ class NetworkAccelerationService:
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             existing = connection.execute("SELECT * FROM subscriber_entitlements WHERE source_order_id=?", (payload["source_order_id"],)).fetchone()
-            if existing is not None:
-                return dict(existing)
-            cursor = connection.execute(
-                "INSERT INTO subscriber_entitlements(subscriber_hash,scenario_id,product_code,valid_from,valid_until,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (payload["subscriber_hash"], scenario["id"], payload["product_code"], start, end, payload["source_order_id"], now, now),
-            )
-            return dict(connection.execute("SELECT * FROM subscriber_entitlements WHERE id=?", (cursor.lastrowid,)).fetchone())
+            if existing is None:
+                try:
+                    cursor = connection.execute(
+                        "INSERT INTO subscriber_entitlements(subscriber_hash,scenario_id,product_code,valid_from,valid_until,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (payload["subscriber_hash"], scenario["id"], payload["product_code"], start, end, payload["source_order_id"], now, now),
+                    )
+                except sqlite3.IntegrityError:
+                    # 并发请求已抢先写入同一来源订单号，按既有记录继续核验
+                    existing = connection.execute("SELECT * FROM subscriber_entitlements WHERE source_order_id=?", (payload["source_order_id"],)).fetchone()
+                    if existing is None:
+                        raise
+                else:
+                    created = dict(connection.execute("SELECT * FROM subscriber_entitlements WHERE id=?", (cursor.lastrowid,)).fetchone())
+                    created["replayed"] = False
+                    return created
+            mismatches = self._entitlement_mismatches(existing, payload, int(scenario["id"]), start, end)
+            if not mismatches:
+                # 完全相同的重试：原样返回既有权益，不更新任何字段，取消或过期状态保持不变
+                replayed = dict(existing)
+                replayed["replayed"] = True
+                return replayed
+            existing = dict(existing)
+        # 冲突审计在独立事务中写入，不随业务拒绝回滚
+        self._record_order_conflict(existing, payload, start, end, mismatches, now)
+        raise ConflictError(
+            "来源订单号已用于不同的权益订单",
+            context={
+                "source_order_id": payload["source_order_id"],
+                "entitlement_id": existing["id"],
+                "mismatched_fields": mismatches,
+                "state": existing["state"],
+            },
+        )
 
     def ingest_sample(self, payload: dict[str, Any]) -> dict[str, Any]:
         scenario = self._scenario(payload["scenario_code"])
@@ -275,6 +301,48 @@ class NetworkAccelerationService:
         sample = self.repository.sample_by_id(sample_id)
         incident = self.repository.incident_by_sample(sample_id)
         return {"sample_id": sample_id, "incident_id": incident["id"] if incident else None, "duplicate": True, "sample": dict(sample)}
+
+    @staticmethod
+    def _entitlement_mismatches(existing: sqlite3.Row, payload: dict[str, Any], scenario_id: int, start: str, end: str) -> list[str]:
+        mismatches = []
+        if existing["subscriber_hash"] != payload["subscriber_hash"]:
+            mismatches.append("subscriber_hash")
+        if int(existing["scenario_id"]) != scenario_id:
+            mismatches.append("scenario_code")
+        if existing["product_code"] != payload["product_code"]:
+            mismatches.append("product_code")
+        if existing["valid_from"] != start:
+            mismatches.append("valid_from")
+        if existing["valid_until"] != end:
+            mismatches.append("valid_until")
+        return mismatches
+
+    def _record_order_conflict(self, existing: dict[str, Any], payload: dict[str, Any], start: str, end: str, mismatches: list[str], now: str) -> None:
+        recorded_scenario = self.repository.scenario_by_id(existing["scenario_id"])
+        incoming = {
+            "scenario_code": payload["scenario_code"],
+            "product_code": payload["product_code"],
+            "valid_from": start,
+            "valid_until": end,
+        }
+        recorded = {
+            "scenario_code": recorded_scenario["code"] if recorded_scenario else str(existing["scenario_id"]),
+            "product_code": existing["product_code"],
+            "valid_from": existing["valid_from"],
+            "valid_until": existing["valid_until"],
+        }
+        detail = {
+            "source_order_id": payload["source_order_id"],
+            "mismatched_fields": mismatches,
+            # 用户标识只保留字段名，不写入任何取值，避免审计泄露用户原始标识
+            "incoming": {field: incoming[field] for field in mismatches if field in incoming},
+            "recorded": {field: recorded[field] for field in mismatches if field in recorded},
+        }
+        with transaction(immediate=True) as connection:
+            connection.execute(
+                "INSERT INTO operation_events(resource_type,resource_id,event_type,actor,detail_json,created_at) VALUES(?,?,?,?,?,?)",
+                ("entitlement", existing["id"], "order_conflict", "entitlement-service", json.dumps(detail, ensure_ascii=False, sort_keys=True), now),
+            )
 
     def _scenario(self, code: str) -> sqlite3.Row:
         row = self.repository.scenario_by_code(code)

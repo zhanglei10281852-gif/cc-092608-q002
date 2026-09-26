@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 from app.core.clock import FrozenClock, to_storage
+from app.core.errors import ConflictError
 from app.database import get_connection
 from app.network.rules import DEFAULT_RULES, allocation_for, judge_quality
 from app.network.service import NetworkAccelerationService
@@ -50,6 +53,19 @@ def sample_payload(**overrides):
         "downlink_mbps": 1.5,
         "uplink_mbps": 0.5,
         "observed_at": "2026-09-26T05:30:00Z",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def entitlement_payload(**overrides):
+    payload = {
+        "subscriber_hash": sample_payload()["subscriber_hash"],
+        "scenario_code": "gdh-rail",
+        "product_code": "rail-boost-day",
+        "valid_from": "2026-09-26T00:00:00Z",
+        "valid_until": "2026-09-27T00:00:00Z",
+        "source_order_id": "order-replay-0001",
     }
     payload.update(overrides)
     return payload
@@ -206,3 +222,135 @@ def test_demo_seed_and_summary(client):
     summary = client.get("/api/network/summary")
     assert summary.status_code == 200
     assert summary.json()["scenarios"]["active"] == 1
+
+
+def test_entitlement_identical_retry_returns_original_record(client):
+    prepare(client)
+    first = client.post("/api/network/entitlements", json=entitlement_payload())
+    assert first.status_code == 201, first.text
+    assert first.json()["replayed"] is False
+    # 完全相同的重试（含等价的时区写法）返回原权益，不新增、不修改记录
+    replay = client.post(
+        "/api/network/entitlements",
+        json=entitlement_payload(valid_from="2026-09-26T08:00:00+08:00", valid_until="2026-09-27T08:00:00+08:00"),
+    )
+    assert replay.status_code == 201
+    assert replay.json()["replayed"] is True
+    assert replay.json()["id"] == first.json()["id"]
+    assert replay.json()["created_at"] == first.json()["created_at"]
+    assert replay.json()["updated_at"] == first.json()["updated_at"]
+    rows = get_connection().execute("SELECT COUNT(*) AS total FROM subscriber_entitlements WHERE source_order_id='order-replay-0001'").fetchone()
+    assert rows["total"] == 1
+    # 新订单号是真实新购，与安全重试可区分
+    another = client.post("/api/network/entitlements", json=entitlement_payload(source_order_id="order-replay-0002"))
+    assert another.status_code == 201
+    assert another.json()["replayed"] is False
+    assert another.json()["id"] != first.json()["id"]
+
+
+def test_entitlement_order_conflict_is_rejected_and_audited(client):
+    prepare(client)
+    created = client.post("/api/network/scenarios", json=scenario_payload(code="metro-01", name="地铁一号线", scene_type="metro"))
+    assert created.status_code == 201
+    first = client.post("/api/network/entitlements", json=entitlement_payload())
+    assert first.status_code == 201
+    cases = [
+        ({"subscriber_hash": "subscriber-000000000099"}, ["subscriber_hash"]),
+        ({"scenario_code": "metro-01"}, ["scenario_code"]),
+        ({"product_code": "rail-boost-week"}, ["product_code"]),
+        ({"valid_from": "2026-09-26T06:00:00Z"}, ["valid_from"]),
+        ({"valid_until": "2026-09-28T00:00:00Z"}, ["valid_until"]),
+        ({"subscriber_hash": "subscriber-000000000099", "product_code": "rail-boost-week"}, ["subscriber_hash", "product_code"]),
+    ]
+    for overrides, fields in cases:
+        response = client.post("/api/network/entitlements", json=entitlement_payload(**overrides))
+        assert response.status_code == 409, response.text
+        error = response.json()["error"]
+        assert error["context"]["mismatched_fields"] == fields
+        assert error["context"]["entitlement_id"] == first.json()["id"]
+        assert error["context"]["source_order_id"] == "order-replay-0001"
+    # 原记录未被覆盖
+    row = get_connection().execute("SELECT * FROM subscriber_entitlements WHERE source_order_id='order-replay-0001'").fetchone()
+    assert row["subscriber_hash"] == sample_payload()["subscriber_hash"]
+    assert row["product_code"] == "rail-boost-day"
+    assert row["updated_at"] == first.json()["updated_at"]
+    total = get_connection().execute("SELECT COUNT(*) AS total FROM subscriber_entitlements").fetchone()
+    assert total["total"] == 1
+    # 审计保留冲突摘要，且不泄露用户标识取值
+    events = get_connection().execute(
+        "SELECT * FROM operation_events WHERE resource_type='entitlement' AND event_type='order_conflict' ORDER BY id"
+    ).fetchall()
+    assert len(events) == len(cases)
+    assert all(event["resource_id"] == first.json()["id"] for event in events)
+    user_event = json.loads(events[0]["detail_json"])
+    assert user_event["mismatched_fields"] == ["subscriber_hash"]
+    assert user_event["incoming"] == {}
+    assert user_event["recorded"] == {}
+    assert "subscriber-000000000099" not in events[0]["detail_json"]
+    scenario_event = json.loads(events[1]["detail_json"])
+    assert scenario_event["incoming"] == {"scenario_code": "metro-01"}
+    assert scenario_event["recorded"] == {"scenario_code": "gdh-rail"}
+    product_event = json.loads(events[2]["detail_json"])
+    assert product_event["incoming"] == {"product_code": "rail-boost-week"}
+    assert product_event["recorded"] == {"product_code": "rail-boost-day"}
+
+
+def test_entitlement_replay_does_not_revive_cancelled_state(client):
+    prepare(client)
+    created = client.post("/api/network/entitlements", json=entitlement_payload()).json()
+    connection = get_connection()
+    connection.execute("UPDATE subscriber_entitlements SET state='cancelled' WHERE id=?", (created["id"],))
+    replay = client.post("/api/network/entitlements", json=entitlement_payload())
+    assert replay.status_code == 201
+    assert replay.json()["replayed"] is True
+    assert replay.json()["state"] == "cancelled"
+    state = connection.execute("SELECT state FROM subscriber_entitlements WHERE id=?", (created["id"],)).fetchone()
+    assert state["state"] == "cancelled"
+
+
+def test_entitlement_concurrent_identical_requests_create_single_record(client):
+    prepare(client)
+    payload = entitlement_payload()
+
+    def submit():
+        return NetworkAccelerationService().add_entitlement(dict(payload))
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda _: submit(), range(6)))
+    assert {item["id"] for item in results} == {results[0]["id"]}
+    assert sum(1 for item in results if not item["replayed"]) == 1
+    total = get_connection().execute("SELECT COUNT(*) AS total FROM subscriber_entitlements").fetchone()
+    assert total["total"] == 1
+
+
+def test_entitlement_concurrent_conflicting_requests_keep_single_record(client):
+    prepare(client)
+    base = entitlement_payload()
+
+    def submit(index):
+        payload = dict(base)
+        if index % 2:
+            payload["subscriber_hash"] = f"subscriber-{index:018d}"
+        try:
+            return NetworkAccelerationService().add_entitlement(payload)
+        except ConflictError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(submit, range(8)))
+    successes = [item for item in results if not isinstance(item, ConflictError)]
+    conflicts = [item for item in results if isinstance(item, ConflictError)]
+    rows = get_connection().execute("SELECT * FROM subscriber_entitlements").fetchall()
+    assert len(rows) == 1
+    stored = dict(rows[0])
+    assert successes
+    for item in successes:
+        assert item["id"] == stored["id"]
+        assert item["subscriber_hash"] == stored["subscriber_hash"]
+    for error in conflicts:
+        assert error.context["mismatched_fields"]
+        assert error.context["entitlement_id"] == stored["id"]
+    events = get_connection().execute(
+        "SELECT COUNT(*) AS total FROM operation_events WHERE resource_type='entitlement' AND event_type='order_conflict'"
+    ).fetchone()
+    assert events["total"] == len(conflicts)
