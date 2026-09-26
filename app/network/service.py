@@ -107,20 +107,71 @@ class NetworkAccelerationService:
         try:
             start = to_storage(from_storage(payload["valid_from"]))
             end = to_storage(from_storage(payload["valid_until"]))
-        except ValueError as exc:
+        except (TypeError, ValueError, AttributeError) as exc:
             raise ValidationError("权益有效期格式不正确") from exc
         if end <= start:
             raise ValidationError("权益结束时间必须晚于开始时间")
+        actor = payload.get("actor") or "order-sync"
+        order_id = payload["source_order_id"]
         now = to_storage(self.clock.now())
+        conflict: ConflictError | None = None
         with transaction(immediate=True) as connection:
-            existing = connection.execute("SELECT * FROM subscriber_entitlements WHERE source_order_id=?", (payload["source_order_id"],)).fetchone()
-            if existing is not None:
-                return dict(existing)
-            cursor = connection.execute(
-                "INSERT INTO subscriber_entitlements(subscriber_hash,scenario_id,product_code,valid_from,valid_until,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (payload["subscriber_hash"], scenario["id"], payload["product_code"], start, end, payload["source_order_id"], now, now),
+            existing = connection.execute("SELECT * FROM subscriber_entitlements WHERE source_order_id=?", (order_id,)).fetchone()
+            if existing is None:
+                try:
+                    cursor = connection.execute(
+                        "INSERT INTO subscriber_entitlements(subscriber_hash,scenario_id,product_code,valid_from,valid_until,source_order_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (payload["subscriber_hash"], scenario["id"], payload["product_code"], start, end, order_id, now, now),
+                    )
+                except sqlite3.IntegrityError:
+                    # 并发请求已抢先写入同一订单号，回读后按重放或冲突处理，保证只存在一条权益
+                    existing = connection.execute("SELECT * FROM subscriber_entitlements WHERE source_order_id=?", (order_id,)).fetchone()
+                    if existing is None:
+                        raise
+            if existing is None:
+                created = connection.execute("SELECT * FROM subscriber_entitlements WHERE id=?", (cursor.lastrowid,)).fetchone()
+                self._order_event(connection, cursor.lastrowid, "created", actor, {
+                    "source_order_id": order_id,
+                    "scenario_code": payload["scenario_code"],
+                    "product_code": payload["product_code"],
+                    "valid_from": start,
+                    "valid_until": end,
+                }, now)
+                return {**dict(created), "replayed": False}
+            mismatched = self._order_mismatches(existing, payload, scenario["id"], start, end)
+            if not mismatched:
+                # 完全相同的重试：原记录（包括取消/过期状态）原样返回，不做任何更新
+                self._order_event(connection, existing["id"], "replay_served", actor, {"source_order_id": order_id, "state": existing["state"]}, now)
+                return {**dict(existing), "replayed": True}
+            # 订单内容冲突：只写冲突审计（不含用户标识），原记录保持不变，提交后再拒绝
+            recorded = connection.execute("SELECT code FROM network_scenarios WHERE id=?", (existing["scenario_id"],)).fetchone()
+            self._order_event(connection, existing["id"], "order_conflict_rejected", actor, {
+                "source_order_id": order_id,
+                "existing_state": existing["state"],
+                "mismatched_fields": mismatched,
+                "recorded": {
+                    "scenario_code": recorded["code"] if recorded else None,
+                    "product_code": existing["product_code"],
+                    "valid_from": existing["valid_from"],
+                    "valid_until": existing["valid_until"],
+                },
+                "incoming": {
+                    "scenario_code": payload["scenario_code"],
+                    "product_code": payload["product_code"],
+                    "valid_from": start,
+                    "valid_until": end,
+                },
+            }, now)
+            conflict = ConflictError(
+                "来源订单号已存在且订单内容不一致",
+                context={
+                    "source_order_id": order_id,
+                    "existing_entitlement_id": existing["id"],
+                    "existing_state": existing["state"],
+                    "mismatched_fields": mismatched,
+                },
             )
-            return dict(connection.execute("SELECT * FROM subscriber_entitlements WHERE id=?", (cursor.lastrowid,)).fetchone())
+        raise conflict
 
     def ingest_sample(self, payload: dict[str, Any]) -> dict[str, Any]:
         scenario = self._scenario(payload["scenario_code"])
@@ -287,6 +338,28 @@ class NetworkAccelerationService:
         if row is None:
             raise NotFoundError("应用画像不存在")
         return row
+
+    @staticmethod
+    def _order_mismatches(existing: sqlite3.Row, payload: dict[str, Any], scenario_id: int, start: str, end: str) -> list[str]:
+        mismatched: list[str] = []
+        if existing["subscriber_hash"] != payload["subscriber_hash"]:
+            mismatched.append("subscriber_hash")
+        if int(existing["scenario_id"]) != int(scenario_id):
+            mismatched.append("scenario_code")
+        if existing["product_code"] != payload["product_code"]:
+            mismatched.append("product_code")
+        if existing["valid_from"] != start:
+            mismatched.append("valid_from")
+        if existing["valid_until"] != end:
+            mismatched.append("valid_until")
+        return mismatched
+
+    @staticmethod
+    def _order_event(connection: sqlite3.Connection, entitlement_id: int, event_type: str, actor: str, detail: dict[str, Any], now: str) -> None:
+        connection.execute(
+            "INSERT INTO operation_events(resource_type,resource_id,event_type,actor,detail_json,created_at) VALUES('entitlement',?,?,?,?,?)",
+            (entitlement_id, event_type, actor, json.dumps(detail, ensure_ascii=False, sort_keys=True), now),
+        )
 
     @staticmethod
     def _event(connection: sqlite3.Connection, session_id: int, event_type: str, actor: str, detail: dict[str, Any], now: str) -> None:

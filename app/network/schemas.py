@@ -50,6 +50,7 @@ class EntitlementCreate(BaseModel):
     valid_from: str
     valid_until: str
     source_order_id: str = Field(min_length=4, max_length=160)
+    actor: str = Field(default="order-sync", min_length=1, max_length=120)
 
 
 class ExperienceSampleCreate(BaseModel):
